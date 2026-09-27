@@ -1,5 +1,7 @@
 # Stick Chase
 
+![A stick figure climbing window panels to catch the cursor, getting swung in circles and flung, then climbing back up](docs/demo.gif)
+
 A stick figure that lives on your Mac's screen and parkours across windows, buttons, icons and
 panels trying to catch your mouse cursor. Once he has it he hangs off it or rides on top; shake the
 mouse to fling him off.
@@ -31,6 +33,7 @@ build/StickChase --film film.png [--alt]    # contact sheet of a simulated chase
 build/StickChase --vision-test in.png out.png   # edge detection on a screenshot
 build/StickChase --stress a.png b.png       # 6-minute chases over screenshot edges: loops, stalls, falls
 build/StickChase --spin-test                # swing him in circles and report turns / letting go
+build/StickChase --demo-gif docs/demo.gif   # the README demo: the real engine in a staged scene
 STICKCHASE_LOG=1 "Stick Chase.app/Contents/MacOS/StickChase"   # log state twice a second
 ```
 

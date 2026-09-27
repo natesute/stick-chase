@@ -11,6 +11,7 @@
 import Cocoa
 import QuartzCore
 import ScreenCaptureKit
+import UniformTypeIdentifiers
 
 // MARK: - Tunables (screen points)
 
@@ -2814,6 +2815,181 @@ func stressTest(_ images: [String], minutes: CGFloat) {
     }
 }
 
+/// Renders the README demo: the real engine running in a staged desktop scene with a scripted
+/// cursor (chase, climb, catch, swing in circles, fling), written as a looping GIF.
+func renderDemoGIF(to path: String) {
+    _ = NSApplication.shared
+    let W: CGFloat = 840, H: CGFloat = 480
+    let frame = CGRect(x: 0, y: 0, width: W, height: H)
+    let floorY: CGFloat = 60
+    let world = World()
+    world.screens = [(frame: frame, visible: CGRect(x: 0, y: floorY, width: W, height: H - 22 - floorY))]
+    // Windows, front to back, with the panels and buttons inside them (window-local rects).
+    struct Win { let id: Int; let rect: CGRect; let dark: Bool; let parts: [CGRect] }
+    let wins = [
+        Win(id: 1, rect: CGRect(x: 330, y: 250, width: 270, height: 150), dark: true,
+            parts: [CGRect(x: 0, y: 0, width: 70, height: 126), CGRect(x: 84, y: 64, width: 172, height: 52), CGRect(x: 84, y: 14, width: 80, height: 22), CGRect(x: 176, y: 14, width: 80, height: 22)]),
+        Win(id: 2, rect: CGRect(x: 40, y: 120, width: 290, height: 210), dark: false,
+            parts: [CGRect(x: 14, y: 128, width: 262, height: 40), CGRect(x: 14, y: 58, width: 120, height: 56), CGRect(x: 146, y: 58, width: 130, height: 56), CGRect(x: 14, y: 14, width: 70, height: 26)]),
+        Win(id: 3, rect: CGRect(x: 540, y: 90, width: 260, height: 180), dark: true,
+            parts: [CGRect(x: 14, y: 96, width: 232, height: 50), CGRect(x: 14, y: 16, width: 108, height: 66), CGRect(x: 136, y: 16, width: 110, height: 66)]),
+    ]
+    let winList = wins.map { ($0.id, $0.rect) }
+    for (id, r) in winList { world.rects[id] = r }
+    // "Detected" edges: the visible tops and sides of every panel and dock icon.
+    func visible(_ r: CGRect, below index: Int) -> [Iv] {
+        var ivs: [Iv] = [(r.minX, r.maxX)]
+        for j in 0..<index where wins[j].rect.minY < r.maxY && wins[j].rect.maxY > r.maxY { ivs = subtract(ivs, wins[j].rect.minX, wins[j].rect.maxX) }
+        return ivs
+    }
+    var vsegs: [Seg] = [], vwalls: [Wall] = []
+    for (i, w) in wins.enumerated() {
+        for part in w.parts {
+            let r = part.offsetBy(dx: w.rect.minX, dy: w.rect.minY)
+            for (a, b) in visible(r, below: i) where b - a > 22 { vsegs.append(Seg(x0: a, x1: b, y: r.maxY, owner: VISION_OWNER)) }
+            if r.height >= 40 {
+                let hidden = (0..<i).contains { wins[$0].rect.intersects(r) }
+                if !hidden {
+                    vwalls.append(Wall(x: r.minX, y0: r.minY, y1: r.maxY, side: 1, owner: VISION_OWNER - 5000, hasTop: false))
+                    vwalls.append(Wall(x: r.maxX, y0: r.minY, y1: r.maxY, side: -1, owner: VISION_OWNER - 5000, hasTop: false))
+                }
+            }
+        }
+    }
+    world.rebuild(winList)
+    world.setVision(segs: vsegs, walls: vwalls)
+
+    let runner = Runner(world: world, cursor: P(120, 200))
+    runner.pos = P(700, floorY); runner.mode = .ground; runner.gOwner = -1; runner.facing = -1
+    runner.drawOffset = .zero
+    runner.rig = Rig(Poses.stand(0))
+    let cur = CursorTracker()
+
+    // Cursor script, driven by what he's doing: wait up high until he climbs to it, swing him in
+    // circles, fling him, then wait somewhere else high for him to come again.
+    var cursor = P(190, 372)
+    var phase = 0, phaseT: CGFloat = 0, hangT: CGFloat = 0, endAt: CGFloat = 45
+    var hangSince: CGFloat = -1, circleStart: CGFloat = -1, flickAt: CGFloat = -1
+    let spot1 = P(190, 372), spot2 = P(470, 436), circleCentre = P(190, 380)
+    var flickFrom = CGPoint.zero
+
+    let dt: CGFloat = 1.0 / 240
+    let fps: CGFloat = 25
+    var frames: [CGImage] = []
+    var tt: CGFloat = 0, nextFrame: CGFloat = 0
+    let arrow: CGPath = {
+        let a = CGMutablePath()
+        let pts: [CGPoint] = [P(0, 0), P(0, -17), P(4, -13.2), P(7.2, -20.5), P(10.4, -19.1), P(7.3, -12), P(12.5, -12)]
+        a.addLines(between: pts); a.closeSubpath(); return a
+    }()
+    while tt < endAt {
+        tt += dt
+        phaseT += dt
+        let holding = runner.mode == .hang || runner.mode == .holdStand || runner.mode == .ride
+        hangT = holding ? hangT + dt : 0
+        switch phase {
+        case 0:  // waiting above the light window
+            cursor = lerp(cursor, spot1, 0.02)
+            if hangT > 1.0 && runner.mode == .hang { phase = 1; phaseT = 0; hangSince = tt }
+        case 1:  // circles
+            let ramp = min(phaseT / 1.2, 1)
+            circleStart = circleStart < 0 ? tt : circleStart
+            cursor = circleCentre + P(cos(2 * .pi * 1.2 * phaseT) - 1, sin(2 * .pi * 1.2 * phaseT)) * (42 * ramp)
+            if phaseT > 5.2 && cos(2 * .pi * 1.2 * phaseT) > 0.95 { phase = 2; phaseT = 0; flickFrom = cursor; flickAt = tt }
+        case 2:  // flick down and right, then keep still while he lands and gets his bearings
+            cursor = lerp(flickFrom, flickFrom + P(420, -120), min(phaseT / 0.1, 1))
+            if phaseT > 2.4 { phase = 3; phaseT = 0 }
+        case 3:  // wander over to the dark window and wait
+            cursor = lerp(cursor, spot2, 0.006)
+            if hangT > 1.2 { phase = 4; phaseT = 0 }
+        default:
+            if endAt > tt + 3 { endAt = tt + 1.5 }
+        }
+        cur.update(cursor, dt)
+        runner.step(dt, cur.s)
+        guard tt >= nextFrame else { continue }
+        nextFrame += 1 / fps
+        runner.render([], dt: 1 / fps)
+
+        let cs = CGColorSpaceCreateDeviceRGB()
+        let ctx = CGContext(data: nil, width: Int(W), height: Int(H), bitsPerComponent: 8, bytesPerRow: 0, space: cs,
+                            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+        // Wallpaper
+        let bg = CGGradient(colorsSpace: cs, colors: [NSColor(srgbRed: 0.16, green: 0.10, blue: 0.36, alpha: 1).cgColor,
+                                                      NSColor(srgbRed: 0.08, green: 0.22, blue: 0.42, alpha: 1).cgColor,
+                                                      NSColor(srgbRed: 0.05, green: 0.08, blue: 0.20, alpha: 1).cgColor] as CFArray,
+                            locations: [0, 0.55, 1])!
+        ctx.drawLinearGradient(bg, start: P(0, H), end: P(W, 0), options: [])
+        let glow = CGGradient(colorsSpace: cs, colors: [NSColor(srgbRed: 0.85, green: 0.35, blue: 0.75, alpha: 0.35).cgColor,
+                                                        NSColor(srgbRed: 0.85, green: 0.35, blue: 0.75, alpha: 0).cgColor] as CFArray, locations: [0, 1])!
+        ctx.drawRadialGradient(glow, startCenter: P(680, 380), startRadius: 0, endCenter: P(680, 380), endRadius: 320, options: [])
+        // Windows, back to front
+        for w in wins.reversed() {
+            let r = w.rect
+            ctx.saveGState()
+            ctx.setShadow(offset: CGSize(width: 0, height: -6), blur: 18, color: NSColor(white: 0, alpha: 0.45).cgColor)
+            ctx.addPath(CGPath(roundedRect: r, cornerWidth: 9, cornerHeight: 9, transform: nil))
+            ctx.setFillColor((w.dark ? NSColor(white: 0.13, alpha: 1) : NSColor(white: 0.96, alpha: 1)).cgColor)
+            ctx.fillPath()
+            ctx.restoreGState()
+            ctx.saveGState()
+            ctx.addPath(CGPath(roundedRect: r, cornerWidth: 9, cornerHeight: 9, transform: nil)); ctx.clip()
+            ctx.setFillColor((w.dark ? NSColor(white: 0.19, alpha: 1) : NSColor(white: 0.88, alpha: 1)).cgColor)
+            ctx.fill(CGRect(x: r.minX, y: r.maxY - 24, width: r.width, height: 24))
+            for (k, col) in [NSColor.systemRed, NSColor.systemYellow, NSColor.systemGreen].enumerated() {
+                ctx.setFillColor(col.cgColor)
+                ctx.fillEllipse(in: CGRect(x: r.minX + 10 + CGFloat(k) * 16, y: r.maxY - 17, width: 10, height: 10))
+            }
+            for (k, part) in w.parts.enumerated() {
+                let pr = part.offsetBy(dx: r.minX, dy: r.minY)
+                let tint: NSColor = w.id == 1 && k == 1 ? NSColor(srgbRed: 0.92, green: 0.26, blue: 0.36, alpha: 1)
+                    : w.id == 3 && k == 0 ? NSColor(srgbRed: 0.25, green: 0.55, blue: 0.95, alpha: 1)
+                    : w.dark ? NSColor(white: 0.24, alpha: 1) : NSColor(white: 0.84, alpha: 1)
+                ctx.setFillColor(tint.cgColor)
+                ctx.addPath(CGPath(roundedRect: pr, cornerWidth: 5, cornerHeight: 5, transform: nil)); ctx.fillPath()
+            }
+            ctx.restoreGState()
+        }
+        // Menu bar and Dock
+        ctx.setFillColor(NSColor(white: 0, alpha: 0.35).cgColor)
+        ctx.fill(CGRect(x: 0, y: H - 22, width: W, height: 22))
+        ctx.setFillColor(NSColor(white: 1, alpha: 0.75).cgColor)
+        for k in 0..<5 { ctx.fill(CGRect(x: W - 30 - CGFloat(k) * 22, y: H - 15, width: 12, height: 8)) }
+        ctx.fillEllipse(in: CGRect(x: 14, y: H - 16, width: 10, height: 10))
+        let dock = CGRect(x: 250, y: 6, width: 340, height: floorY - 12)
+        ctx.addPath(CGPath(roundedRect: dock, cornerWidth: 14, cornerHeight: 14, transform: nil))
+        ctx.setFillColor(NSColor(white: 1, alpha: 0.16).cgColor); ctx.fillPath()
+        let iconCols: [NSColor] = [.systemBlue, .systemGreen, .systemOrange, .systemPink, .systemPurple, .systemTeal, .systemYellow]
+        for (k, col) in iconCols.enumerated() {
+            let ir = CGRect(x: dock.minX + 12 + CGFloat(k) * 46, y: dock.minY + 5, width: 38, height: 38)
+            ctx.addPath(CGPath(roundedRect: ir, cornerWidth: 9, cornerHeight: 9, transform: nil))
+            ctx.setFillColor(col.cgColor); ctx.fillPath()
+        }
+        // Figure, with motion trails
+        ctx.setLineCap(.round); ctx.setLineJoin(.round)
+        for (g, a) in [0.32, 0.18, 0.09].enumerated() where runner.smear > 0.02 && 2 + g * 2 < runner.ghostPaths.count {
+            ctx.setStrokeColor(NSColor(white: 1, alpha: CGFloat(a) * runner.smear).cgColor); ctx.setLineWidth(LINE_W * 0.9)
+            ctx.addPath(runner.ghostPaths[2 + g * 2]); ctx.strokePath()
+        }
+        drawFigure(ctx, runner.displayPose, runner.pos + runner.drawOffset, runner.facing)
+        // Cursor
+        ctx.saveGState()
+        ctx.translateBy(x: cursor.x, y: cursor.y)
+        ctx.addPath(arrow)
+        ctx.setFillColor(NSColor.black.cgColor); ctx.setStrokeColor(NSColor.white.cgColor); ctx.setLineWidth(1.4)
+        ctx.drawPath(using: .fillStroke)
+        ctx.restoreGState()
+        if let img = ctx.makeImage() { frames.append(img) }
+    }
+    let url = URL(fileURLWithPath: path) as CFURL
+    guard let dest = CGImageDestinationCreateWithURL(url, UTType.gif.identifier as CFString, frames.count, nil) else { return }
+    CGImageDestinationSetProperties(dest, [kCGImagePropertyGIFDictionary: [kCGImagePropertyGIFLoopCount: 0]] as CFDictionary)
+    let props = [kCGImagePropertyGIFDictionary: [kCGImagePropertyGIFDelayTime: 1 / fps]] as CFDictionary
+    for f in frames { CGImageDestinationAddImage(dest, f, props) }
+    CGImageDestinationFinalize(dest)
+    print("wrote \(path): \(frames.count) frames, hang at \(hangSince), circles at \(circleStart), flick at \(flickAt)", runner.stats)
+}
+
 /// Hangs him on a cursor, then moves the cursor in circles and reports how he swings.
 func spinTest() {
     _ = NSApplication.shared
@@ -2852,6 +3028,7 @@ let args = CommandLine.arguments
 if let i = args.firstIndex(of: "--snapshot"), i + 1 < args.count { renderSnapshot(to: args[i + 1]); exit(0) }
 if args.contains("--selftest") { selfTest(); exit(0) }
 if args.contains("--spin-test") { spinTest(); exit(0) }
+if let i = args.firstIndex(of: "--demo-gif"), i + 1 < args.count { renderDemoGIF(to: args[i + 1]); exit(0) }
 if let i = args.firstIndex(of: "--stress") { stressTest(Array(args[(i + 1)...]), minutes: 6); exit(0) }
 if let i = args.firstIndex(of: "--icon"), i + 1 < args.count { renderIconSet(to: args[i + 1]); exit(0) }
 if let i = args.firstIndex(of: "--film"), i + 1 < args.count { renderFilm(to: args[i + 1], seed: args.contains("--alt") ? 1 : 0); exit(0) }
