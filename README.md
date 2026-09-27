@@ -29,3 +29,7 @@ build/StickChase --film film.png [--alt]    # contact sheet of a simulated chase
 build/StickChase --vision-test in.png out.png   # edge detection on a screenshot
 STICKCHASE_LOG=1 "Stick Chase.app/Contents/MacOS/StickChase"   # log state twice a second
 ```
+
+## License
+
+MIT. See [LICENSE](LICENSE).
