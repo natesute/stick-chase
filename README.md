@@ -17,8 +17,10 @@ identity if one is installed (so the Screen Recording permission survives rebuil
 ## Screen vision
 
 With Screen Recording permission he treats edges found in the screen image as ledges and walls.
-Without it he only uses window frames. Grant it from the menu bar icon ("Enable Screen Vision…"),
-then choose "Restart Stick Chase". Captured frames are only used for edge detection and never saved.
+Without it he only uses window frames. Click the Dock icon to open the controls, choose "Enable…" next to Screen vision, allow it in
+System Settings, then click "Restart". Captured frames are only used for edge detection and never saved.
+
+To quit, right-click the Dock icon and choose Quit (or use the Quit button in the controls).
 
 ## Dev tools
 
