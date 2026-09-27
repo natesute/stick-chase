@@ -777,6 +777,22 @@ func stableRuns(_ now: [(Int, Int, Int)], _ before: [(Int, Int, Int)], longEnoug
     }
 }
 
+struct BrightnessMap {
+    let frame: CGRect, w: Int, h: Int, cells: [UInt8]
+    /// Fraction of the area in `r` (screen coordinates) that is light.
+    func lightFraction(in r: CGRect) -> CGFloat? {
+        let c = r.intersection(frame)
+        guard !c.isNull, c.width > 0, c.height > 0 else { return nil }
+        let sx = CGFloat(w) / frame.width, sy = CGFloat(h) / frame.height
+        let x0 = max(0, Int((c.minX - frame.minX) * sx)), x1 = min(w - 1, Int((c.maxX - frame.minX) * sx))
+        let y0 = max(0, Int((frame.maxY - c.maxY) * sy)), y1 = min(h - 1, Int((frame.maxY - c.minY) * sy))
+        guard x1 >= x0, y1 >= y0 else { return nil }
+        var light = 0, total = 0
+        for y in y0...y1 { for x in x0...x1 { total += 1; if cells[y * w + x] > 175 { light += 1 } } }
+        return CGFloat(light) / CGFloat(total)
+    }
+}
+
 final class Vision: NSObject, SCStreamOutput, SCStreamDelegate {
     private var streams: [SCStream] = []
     private var displayFor: [ObjectIdentifier: CGDirectDisplayID] = [:]
@@ -785,6 +801,8 @@ final class Vision: NSObject, SCStreamOutput, SCStreamDelegate {
     private var results: [CGDirectDisplayID: ([Seg], [Wall])] = [:]
     private let queue = DispatchQueue(label: "stickchase.vision", qos: .utility)
     var onUpdate: (([Seg], [Wall]) -> Void)?
+    /// Coarse brightness of a screen (4x4-point cells, row 0 at the top), for picking his outline.
+    var onBackground: ((BrightnessMap) -> Void)?
     private(set) var running = false
 
     func start(completion: @escaping (Bool) -> Void) {
@@ -852,6 +870,17 @@ final class Vision: NSObject, SCStreamOutput, SCStreamDelegate {
             }
         }
         CVPixelBufferUnlockBaseAddress(pb, .readOnly)
+        let bw = w / 4, bh = h / 4
+        var cells = [UInt8](repeating: 0, count: bw * bh)
+        for cy in 0..<bh {
+            for cx in 0..<bw {
+                var sum = 0
+                for yy in 0..<4 { let row = (cy * 4 + yy) * w + cx * 4; sum += Int(lum[row]) + Int(lum[row + 1]) + Int(lum[row + 2]) + Int(lum[row + 3]) }
+                cells[cy * bw + cx] = UInt8(sum / 16)
+            }
+        }
+        let map = BrightnessMap(frame: frame, w: bw, h: bh, cells: cells)
+        DispatchQueue.main.async { self.onBackground?(map) }
         let found = detectEdges(lum, w, h)
         let prev = previous[id] ?? found
         let stable = (h: stableRuns(found.h, prev.h, longEnough: 80), v: stableRuns(found.v, prev.v, longEnough: 90))
@@ -1241,7 +1270,7 @@ struct Personality {
 
 struct Plan { var action: Action; var points: [CGPoint]; var made: CGFloat; var cursor: CGPoint; var version: Int }
 
-struct FigureLayers { var near: CAShapeLayer; var far: CAShapeLayer; var head: CAShapeLayer; var ghosts: [CAShapeLayer] }
+struct FigureLayers { var outline: CAShapeLayer; var near: CAShapeLayer; var far: CAShapeLayer; var head: CAShapeLayer; var ghosts: [CAShapeLayer] }
 
 final class Runner {
     unowned let world: World
@@ -1361,7 +1390,7 @@ final class Runner {
         displayPose = rig.update(target, dt, boost: boost, drag: drag)
     }
 
-    func render(_ origins: [CGPoint], dt: CGFloat) {
+    func render(_ origins: [CGPoint], dt: CGFloat, outline: CGFloat = 0) {
         var root = pos + drawOffset
         if mode == .ride && hopT > 0 { root.y += sin(.pi * (1 - hopT / 0.35)) * 10 }
         let (near, far, head) = figurePaths(displayPose, root, facing)
@@ -1380,6 +1409,17 @@ final class Runner {
             layers[i].near.path = near.copy(using: &tr)
             layers[i].far.path = far.copy(using: &tr)
             layers[i].head.path = head.copy(using: &tr)
+            if outline > 0.01 {
+                // Limbs plus a slightly smaller head circle, so the outline is the same thin rim everywhere.
+                let o = CGMutablePath()
+                o.addPath(near); o.addPath(far)
+                let hb = head.boundingBox
+                o.addEllipse(in: hb.insetBy(dx: 0.8, dy: 0.8))
+                layers[i].outline.path = o.copy(using: &tr)
+                layers[i].outline.opacity = Float(outline)
+            } else {
+                layers[i].outline.path = nil
+            }
             for (g, gl) in layers[i].ghosts.enumerated() {
                 let idx = 2 + g * 2
                 if smear > 0.02 && idx < ghostPaths.count {
@@ -2221,8 +2261,13 @@ final class Overlay {
             return l
         }
         let ghosts = (0..<3).map { _ -> CAShapeLayer in let g = mk(1, fill: false); g.lineWidth = LINE_W * 0.9; return g }
+        // A thin dark outline, faded in only when he's in front of something light.
+        let outline = mk(1, fill: false)
+        outline.strokeColor = NSColor(white: 0.1, alpha: 0.75).cgColor
+        outline.lineWidth = LINE_W + 1.6
+        outline.opacity = 0
         let far = mk(0.7, fill: false)
-        return FigureLayers(near: mk(1, fill: false), far: far, head: mk(1, fill: true), ghosts: ghosts)
+        return FigureLayers(outline: outline, near: mk(1, fill: false), far: far, head: mk(1, fill: true), ghosts: ghosts)
     }
 }
 
@@ -2296,6 +2341,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var showSurfaces = false
     var shadow = false
     let vision = Vision()
+    var brightness: [BrightnessMap] = []
+    var outline: CGFloat = 0
     let cursor = CursorTracker()
     var lastTick = CACurrentMediaTime()
     var lastWorldRefresh: CFTimeInterval = 0
@@ -2320,6 +2367,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self else { return }
             self.world.setVision(segs: segs, walls: walls)
             self.runner.worldChanged()
+        }
+        vision.onBackground = { [weak self] map in
+            guard let self else { return }
+            self.brightness.removeAll { $0.frame == map.frame }
+            self.brightness.append(map)
         }
         startVision(prompt: true)
         NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { [weak self] _ in
@@ -2445,6 +2497,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         controls?.refresh()
     }
 
+    /// How strongly to outline him: on over light backgrounds, off over dark ones, with a dead band
+    /// so he doesn't flicker along the edge of a white panel. Without screen vision he can't see the
+    /// background, so a faint outline stays on.
+    func outlineStrength(_ dt: CGFloat) -> CGFloat {
+        var target: CGFloat = 0.55
+        if vision.running {
+            let p = runner.pos + runner.drawOffset
+            let area = CGRect(x: p.x - 16, y: p.y - 4, width: 32, height: 44)
+            let light = brightness.compactMap { $0.lightFraction(in: area) }.max() ?? 0
+            target = light > 0.45 ? 1 : (light < 0.25 ? 0 : (outline > 0.5 ? 1 : 0))
+        }
+        outline = approach(outline, target, 5 * dt)
+        return outline
+    }
+
     func drawSurfaces() {
         let segs = CGMutablePath(), walls = CGMutablePath(), plans = CGMutablePath()
         for s in world.segs { segs.move(to: P(s.x0, s.y)); segs.addLine(to: P(s.x1, s.y)) }
@@ -2475,7 +2542,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         runner.step(dt / 2, cursor.s)
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        runner.render(overlays.map { $0.origin }, dt: dt)
+        runner.render(overlays.map { $0.origin }, dt: dt, outline: outlineStrength(dt))
         frame += 1
         if showSurfaces && frame % 8 == 0 { drawSurfaces() }
         CATransaction.commit()
@@ -2990,6 +3057,31 @@ func renderDemoGIF(to path: String) {
     print("wrote \(path): \(frames.count) frames, hang at \(hangSince), circles at \(circleStart), flick at \(flickAt)", runner.stats)
 }
 
+/// Shows the figure over white, grey and dark backgrounds with and without the outline.
+func renderOutlineTest(to path: String) {
+    let bgs: [CGFloat] = [1.0, 0.93, 0.6, 0.12]
+    let cell = CGSize(width: 70, height: 60)
+    let size = NSSize(width: cell.width * CGFloat(bgs.count), height: cell.height * 2)
+    let (rep, ctx) = makeCanvas(size, scale: 3)
+    for (i, b) in bgs.enumerated() {
+        for row in 0..<2 {
+            let r = CGRect(x: CGFloat(i) * cell.width, y: CGFloat(row) * cell.height, width: cell.width, height: cell.height)
+            ctx.setFillColor(NSColor(white: b, alpha: 1).cgColor); ctx.fill(r)
+            let (near, far, head) = figurePaths(Poses.locomote(0.1, RUN_SPEED), P(r.midX, r.minY + 12), 1)
+            ctx.setLineCap(.round); ctx.setLineJoin(.round)
+            if row == 1 {
+                ctx.setStrokeColor(NSColor(white: 0.1, alpha: 0.75).cgColor); ctx.setLineWidth(LINE_W + 1.6)
+                ctx.addPath(near); ctx.addPath(far); ctx.addEllipse(in: head.boundingBox.insetBy(dx: 0.8, dy: 0.8)); ctx.strokePath()
+            }
+            ctx.setLineWidth(LINE_W)
+            ctx.setStrokeColor(NSColor(white: 1, alpha: 0.7).cgColor); ctx.addPath(far); ctx.strokePath()
+            ctx.setStrokeColor(NSColor.white.cgColor); ctx.addPath(near); ctx.strokePath()
+            ctx.setFillColor(NSColor.white.cgColor); ctx.addPath(head); ctx.fillPath()
+        }
+    }
+    saveCanvas(rep, path)
+}
+
 /// Hangs him on a cursor, then moves the cursor in circles and reports how he swings.
 func spinTest() {
     _ = NSApplication.shared
@@ -3028,6 +3120,7 @@ let args = CommandLine.arguments
 if let i = args.firstIndex(of: "--snapshot"), i + 1 < args.count { renderSnapshot(to: args[i + 1]); exit(0) }
 if args.contains("--selftest") { selfTest(); exit(0) }
 if args.contains("--spin-test") { spinTest(); exit(0) }
+if let i = args.firstIndex(of: "--outline-test"), i + 1 < args.count { renderOutlineTest(to: args[i + 1]); exit(0) }
 if let i = args.firstIndex(of: "--demo-gif"), i + 1 < args.count { renderDemoGIF(to: args[i + 1]); exit(0) }
 if let i = args.firstIndex(of: "--stress") { stressTest(Array(args[(i + 1)...]), minutes: 6); exit(0) }
 if let i = args.firstIndex(of: "--icon"), i + 1 < args.count { renderIconSet(to: args[i + 1]); exit(0) }
