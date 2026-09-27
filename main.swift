@@ -242,9 +242,30 @@ final class World {
     }
 
     /// New edges from the screen image.
+    private var segMemory: [(seg: Seg, misses: Int)] = []
+    private var wallMemory: [(wall: Wall, misses: Int)] = []
+
+    /// New edges from the screen image. An edge that drops out of detection is kept for a few
+    /// updates, so a one-frame flicker doesn't pull the floor out from under him.
     func setVision(segs: [Seg], walls: [Wall]) {
-        visionSegs = segs
-        visionWalls = walls
+        var outSegs = segs
+        var mem = segs.map { (seg: $0, misses: 0) }
+        for m in segMemory where m.misses < 3 {
+            let seen = segs.contains { abs($0.y - m.seg.y) <= 2 && min($0.x1, m.seg.x1) - max($0.x0, m.seg.x0) >= (m.seg.x1 - m.seg.x0) * 0.5 }
+            if !seen { outSegs.append(m.seg); mem.append((m.seg, m.misses + 1)) }
+        }
+        segMemory = mem
+        var outWalls = walls
+        var wmem = walls.map { (wall: $0, misses: 0) }
+        for m in wallMemory where m.misses < 3 {
+            let seen = walls.contains { abs($0.x - m.wall.x) <= 2 && min($0.y1, m.wall.y1) - max($0.y0, m.wall.y0) >= (m.wall.y1 - m.wall.y0) * 0.5 }
+            if !seen { outWalls.append(m.wall); wmem.append((m.wall, m.misses + 1)) }
+        }
+        wallMemory = wmem
+        for i in outSegs.indices { outSegs[i].owner = VISION_OWNER - i }
+        for i in outWalls.indices { outWalls[i].owner = VISION_OWNER - 5000 - i }
+        visionSegs = outSegs
+        visionWalls = outWalls
         rebuild(lastWins)
     }
 
@@ -516,7 +537,10 @@ final class World {
         return (0, need - JUMP_MAX + max(0, abs(dx) - 30), .frustrated)
     }
 
-    func plan(seg: Int, x: CGFloat, cursor c: CGPoint, prevSig: Int, climbMult: CGFloat) -> (Action, [CGPoint], Int)? {
+    func plan(seg: Int, x: CGFloat, cursor c: CGPoint, prevSig: Int, climbMult: CGFloat, banned: Set<Int> = []) -> (Action, [CGPoint], Int)? {
+        // Route identities use coarse buckets so detection jitter doesn't make a route look new.
+        func yb(_ y: CGFloat) -> Int { Int((y / 8).rounded()) }
+        func xb(_ s: Seg) -> Int { Int(((s.x0 + s.x1) / 2 / 40).rounded()) }
         let n = nodes.count
         guard n > 0, seg < segNodes.count, !segNodes[seg].isEmpty else { return nil }
         var dist = [CGFloat](repeating: .infinity, count: n)
@@ -539,10 +563,10 @@ final class World {
                 let dst = segs[nodes[e.to].seg]
                 switch e.kind {
                 case .walk: break
-                case .jump: es = sig(1, Int(dst.y), Int(dst.x0))
-                case .ledge: es = sig(2, Int(dst.y), Int(dst.x0))
-                case .drop: es = sig(3, Int(dst.y), Int(dst.x0))
-                case .climb(let wi): cost *= climbMult; es = sig(4, Int(walls[wi].x), Int(walls[wi].side))
+                case .jump: es = sig(1, yb(dst.y), xb(dst))
+                case .ledge: es = sig(2, yb(dst.y), xb(dst))
+                case .drop: es = sig(3, yb(dst.y), xb(dst))
+                case .climb(let wi): cost *= climbMult; es = sig(4, Int((walls[wi].x / 8).rounded()), Int(walls[wi].side))
                 }
                 let nd = d + cost
                 if nd < dist[e.to] {
@@ -564,22 +588,26 @@ final class World {
             let cx = clampf(c.x, s.x0 + 3, s.x1 - 3)
             let from = abs(cx - nd.x) <= NODE_STRIDE * 0.5 + 2 ? cx : nd.x
             let g = evalGoal(seg: nd.seg, x: from, c)
-            let sg = firstSig[i] != 0 ? firstSig[i] : sig(9, Int(s.y), g.residual > 0 ? 1 : 0)
+            let sg = firstSig[i] != 0 ? firstSig[i] : sig(9, yb(s.y), g.residual > 0 ? 1 : 0)
             var score = dist[i] + abs(from - nd.x) / RUN_SPEED + g.extra + (g.residual > 0 ? 2 + g.residual * 0.03 : 0)
-            if sg == prevSig { score -= 0.4 }
+            if sg == prevSig { score -= 0.6 }
+            if banned.contains(sg) { score += 6 }
             if score < bestScore { bestScore = score; bestNode = i; bestFrom = from; bestKind = g.kind; bestWall = nil; bestSig = sg }
         }
         // Climb a wall and grab the cursor from it, or leap off the wall at it.
         for w in walls {
             let ddx = (c.x - w.x) * -w.side
-            guard ddx > -12 && ddx < LEAP_RANGE && c.y <= w.y1 + 25 && c.y >= w.y0 + 6 else { continue }
+            let canLeap = ddx > 16 && ddx < LEAP_RANGE && c.y <= w.y1 + 25 && c.y >= w.y0 + 6
+            let canGrab = abs(c.x - w.x) < 12 && c.y >= w.y0 + 6 && c.y <= w.y1 + 2
+            guard canLeap || canGrab else { continue }
             for si in segsInY(w.y0 - WALL_GRAB_REACH, min(w.y1 - 15, c.y - HAND_REACH - 10)) where climbBase(segs[si], w) {
                 guard let ni = nearestNode(seg: si, x: w.baseX), dist[ni] < .infinity else { continue }
                 let s = segs[si]
                 let climbT = max(0, c.y - HAND_REACH - s.y) / CLIMB_SPEED * climbMult
-                let sg = firstSig[ni] != 0 ? firstSig[ni] : sig(8, Int(w.x), Int(w.side))
+                let sg = firstSig[ni] != 0 ? firstSig[ni] : sig(8, Int((w.x / 8).rounded()), Int(w.side))
                 var score = dist[ni] + abs(nodes[ni].x - w.baseX) / RUN_SPEED + climbT + max(0, ddx) / 400 + 0.45
-                if sg == prevSig { score -= 0.4 }
+                if sg == prevSig { score -= 0.6 }
+                if banned.contains(sg) { score += 6 }
                 if score < bestScore { bestScore = score; bestNode = ni; bestFrom = w.baseX; bestWall = w; bestSig = sg }
             }
         }
@@ -1238,6 +1266,7 @@ final class Runner {
     var wallIntent: Wall?
     var intent = Intent.none
     var trick = Trick.none, trickDur: CGFloat = 0.5
+    var ledgeTargetY: CGFloat?, freeFall = false
     // wall
     var wall: Wall?
     var wallRect: CGRect?
@@ -1254,6 +1283,29 @@ final class Runner {
     // planning
     var plan: Plan?
     var lastSig = 0
+    // Diagnostics: event counts and recent route attempts (for loop detection).
+    var stats: [String: Int] = [:]
+    var attemptLog: [(sig: Int, t: CGFloat)] = []
+    func note(_ k: String) { stats[k, default: 0] += 1 }
+    var banned: [Int: CGFloat] = [:]
+    var recent: [(sig: Int, t: CGFloat)] = []
+    var lastCursor = CGPoint.zero
+    /// Records a route step as it starts. The same step three times in 12s without catching the
+    /// cursor means he's looping, so that route is set aside for a while.
+    func noteAttempt() {
+        attemptLog.append((lastSig, t)); if attemptLog.count > 400 { attemptLog.removeFirst(100) }
+        var key = lastSig
+        if let p = plan, case .catchJump = p.action { key = sig(key, Int(lastCursor.x / 30), Int(lastCursor.y / 30)) }
+        recent.append((key, t))
+        recent.removeAll { t - $0.t > 12 }
+        if recent.filter({ $0.sig == key }).count >= 3 {
+            ban(lastSig, for: 8)
+            recent.removeAll { $0.sig == key }
+            note("loop broken")
+            if let p = plan { note(String(format: "  loop: %@ from (%.0f,%.0f) cursor (%.0f,%.0f)", "\(p.action)".components(separatedBy: ",").first ?? "", pos.x, pos.y, lastCursor.x, lastCursor.y)) }
+        }
+    }
+    func ban(_ s: Int, for secs: CGFloat) { banned[s] = t + secs }
     var styleClimb: CGFloat = 1, styleT: CGFloat = 0
     // animation
     var t: CGFloat = 0, runPhase: CGFloat = 0
@@ -1275,6 +1327,7 @@ final class Runner {
 
     func step(_ dt: CGFloat, _ cur: CursorState) {
         t += dt
+        lastCursor = cur.p
         grabCooldown -= dt
         styleT -= dt
         if styleT <= 0 { styleT = rnd(5...9); styleClimb = pers.climbPref * rnd(0.85...1.2) }
@@ -1382,6 +1435,7 @@ final class Runner {
         airT = 0; peakY = pos.y; launchY = pos.y
         ignoreAboveY = nil; wallIntent = nil; jumpTarget = nil
         trick = .none; intent = .none
+        ledgeTargetY = nil; freeFall = false
         skidding = false; antT = 0; pending = nil
         if abs(vx) > 10 { facing = vx > 0 ? 1 : -1 }
     }
@@ -1401,8 +1455,10 @@ final class Runner {
     }
 
     func performTakeoff(vx: CGFloat, vy: CGFloat, target: CGPoint?, intent: Intent, styled: Bool) {
+        if mode == .ground { noteAttempt() }
         launch(vx: vx, vy: vy)
         jumpTarget = target
+        ledgeTargetY = target?.y
         self.intent = intent
         let air = 2 * vy / GRAV
         if styled && intent == .none && air > 0.42 && chance(pers.flair * 0.55) {
@@ -1412,7 +1468,7 @@ final class Runner {
         }
     }
 
-    func fall() { launch(vx: vel.x, vy: 0) }
+    func fall() { launch(vx: vel.x, vy: 0); freeFall = true }
 
     func faceToward(_ x: CGFloat) { if abs(x - pos.x) > 6 { facing = x > pos.x ? 1 : -1 } }
 
@@ -1492,11 +1548,12 @@ final class Runner {
             guard let p = plan else { return true }
             if p.version != world.version && t - p.made > 0.25 { return true }
             if t - p.made > 0.9 { return true }
-            return (p.cursor - c).len > 28 && t - p.made > 0.22
+            return (p.cursor - c).len > 28 && t - p.made > 0.3
         }()
         if stale {
             let wasFrustrated = plan?.action.isFrustrated ?? false
-            if let r = world.plan(seg: si, x: pos.x, cursor: c, prevSig: lastSig, climbMult: styleClimb) {
+            banned = banned.filter { $0.value > t }
+            if let r = world.plan(seg: si, x: pos.x, cursor: c, prevSig: lastSig, climbMult: styleClimb, banned: Set(banned.keys)) {
                 if r.2 != lastSig { edgeHop = chance(pers.flair * 0.5) }
                 plan = Plan(action: r.0, points: r.1, made: t, cursor: c, version: world.version)
                 lastSig = r.2
@@ -1524,10 +1581,10 @@ final class Runner {
                 }
                 runToward(edgeX + dir * 30, seg, carry: true, clampToSeg: false, dt)
             } else if runToward(fx, seg, carry: false, dt) {
-                preDropT = 0.08; dropCatching = false
+                preDropT = 0.08; dropCatching = false; noteAttempt()
             }
         case .dropCatch(let fx):
-            if runToward(fx, seg, carry: false, dt) { preDropT = 0.06; dropCatching = true }
+            if runToward(fx, seg, carry: false, dt) { preDropT = 0.06; dropCatching = true; noteAttempt() }
         case .climb(_, let w, let leap):
             if runToward(w.baseX, seg, carry: true, dt) { startWall(w, leap: leap) }
         case .catchJump:
@@ -1569,7 +1626,10 @@ final class Runner {
             takeoff(vx: clampf(dx / (vy / GRAV), -AIR_VX_MAX, AIR_VX_MAX), vy: vy, target: to, intent: .none, styled: false)
             return
         }
-        guard let j = solveJump(dx: dx, dy: dy) else { plan = nil; return }
+        guard let j = solveJump(dx: dx, dy: dy) else {
+            // Can't make it from here after all: try another way for a bit.
+            ban(lastSig, for: 4); note("jump impossible"); plan = nil; return
+        }
         takeoff(vx: j.vx, vy: j.vy, target: to, intent: .none, styled: true)
     }
 
@@ -1656,10 +1716,11 @@ final class Runner {
             if vel.y < -120 { wallIntent = nil }
         }
         // Catch an edge he's come up short of and pull up onto it.
-        if ignoreAboveY == nil && vel.y < 140 && airT > 0.08 {
+        if ignoreAboveY == nil && vel.y < 140 && airT > 0.08 && intent == .none && (freeFall || ledgeTargetY != nil) {
             let hx = pos.x + facing * 4, handY = pos.y + HAND_REACH - 2
             for i in world.segsInY(max(launchY + 8, pos.y + 12), handY) where world.segs[i].contains(hx, 3) {
                 let s = world.segs[i]
+                if let ty = ledgeTargetY, abs(s.y - ty) > 3 { continue }
                 startLedge(s, x: clampf(hx, s.x0 + 2, s.x1 - 2)); return
             }
         }
@@ -1710,6 +1771,7 @@ final class Runner {
     // MARK: Walls
 
     func startWall(_ w: Wall, leap: Bool) {
+        noteAttempt()
         plan = nil
         pos.x = w.baseX
         facing = w.side
@@ -1747,6 +1809,7 @@ final class Runner {
             beginMantle()
         } else {
             launch(vx: -w.side * 200, vy: 400)
+            freeFall = true
             trick = .back; trickDur = 0.42
         }
     }
@@ -1793,6 +1856,7 @@ final class Runner {
             // Spring for the top instead of climbing the last bit.
             launch(vx: 0, vy: (2 * GRAV * (remaining + 12)).squareRoot())
             facing = w.side
+            ledgeTargetY = w.y1
             return
         }
         if remaining > 1 && !stuck {
@@ -1808,6 +1872,7 @@ final class Runner {
     }
 
     func startLedge(_ s: Seg, x: CGFloat) {
+        note("ledge grab")
         mode = .ledge
         edge = P(x, s.y); edgeOwner = s.owner; edgeRect = world.rects[s.owner]
         ledgeT = rnd(0.04...0.28) * pers.patience
@@ -1861,6 +1926,7 @@ final class Runner {
         omega = clampf((vel.x - cur.v.x) / HANG_LEN, -7, 7)
         theta = 0
         mode = .hang
+        recent.removeAll()
         setPos(P(c.x, c.y - 62 * S))
         trick = .none; intent = .none; wallIntent = nil; leapIntent = false; plan = nil
         stillT = 0; trickT = rnd(1.2...2.5); spins = 0; grip = GRAV
@@ -1918,6 +1984,7 @@ final class Runner {
         if v.len > 1900 { v = v * (1900 / v.len) }
         setPos(feet)
         launch(vx: v.x, vy: v.y)
+        freeFall = true
         // Keep tumbling the way he was spinning. World spin = facing * local rotation.
         if abs(omega) > 5 {
             trick = omega * facing > 0 ? .back : .front
@@ -2018,6 +2085,7 @@ final class Runner {
     }
 
     private func dropOff() {
+        note(gOwner <= VISION_OWNER ? "fell: detected edge vanished" : "fell: window moved")
         if mode == .holdStand { mode = .hang; theta = 0; omega = 0 } else { fall() }
     }
 
@@ -2661,6 +2729,91 @@ func renderIconSet(to dir: String) {
     }
 }
 
+/// Chases a wandering cursor over edges detected in real screenshots, with the edges flickering
+/// the way live detection does, and reports loops, stalls and unplanned falls.
+func stressTest(_ images: [String], minutes: CGFloat) {
+    _ = NSApplication.shared
+    for path in images {
+        guard let img = NSImage(contentsOfFile: path), let cg = img.cgImage(forProposedRect: nil, context: nil, hints: nil) else { continue }
+        let w = cg.width / 2, h = cg.height / 2
+        var lum = [UInt8](repeating: 0, count: w * h)
+        lum.withUnsafeMutableBytes { buf in
+            let c = CGContext(data: buf.baseAddress, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w,
+                              space: CGColorSpaceCreateDeviceGray(), bitmapInfo: 0)!
+            c.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
+        }
+        let frame = CGRect(x: 0, y: 0, width: w, height: h)
+        let (baseSegs, baseWalls) = surfaces(from: detectEdges(lum, w, h), imgW: w, imgH: h, frame: frame, lum: lum)
+        let world = World()
+        world.screens = [(frame: frame, visible: CGRect(x: 0, y: 0, width: w, height: h - 33))]
+        world.setVision(segs: baseSegs, walls: baseWalls)
+        let r = Runner(world: world, cursor: P(frame.midX, frame.midY))
+        let cur = CursorTracker()
+        let dt: CGFloat = 1.0 / 120
+        var c = P(frame.midX, frame.midY), target = c
+        var tt: CGFloat = 0, nextTarget: CGFloat = 0, nextFlicker: CGFloat = 0
+        var stalls = 0, stillSince: CGFloat = 0, anchor = r.pos
+        var caughtTime: CGFloat = 0, reachableTime: CGFloat = 0
+        var trace: [String] = []
+        var reversals = 0, lastDir: CGFloat = 0, flips = 0, lastPlanSig = 0, attemptsAtFlip = 0
+        while tt < minutes * 60 {
+            tt += dt
+            if tt >= nextTarget {
+                target = P(CGFloat.random(in: frame.minX + 20...frame.maxX - 20), CGFloat.random(in: 40...frame.maxY - 60))
+                nextTarget = tt + CGFloat.random(in: 2...6)
+            }
+            if tt >= nextFlicker {
+                // Live detection is noisy: some edges drop out for a frame, others shift a pixel.
+                var segs = baseSegs.filter { _ in CGFloat.random(in: 0...1) > 0.06 }
+                for i in segs.indices where CGFloat.random(in: 0...1) < 0.15 {
+                    segs[i].x0 += CGFloat.random(in: -2...2); segs[i].x1 += CGFloat.random(in: -2...2)
+                }
+                world.setVision(segs: segs, walls: baseWalls.filter { _ in CGFloat.random(in: 0...1) > 0.06 })
+                r.worldChanged()
+                nextFlicker = tt + 0.25
+            }
+            c = lerp(c, target, 0.03)
+            cur.update(c, dt)
+            r.step(dt, cur.s)
+            let holding = r.mode == .hang || r.mode == .ride || r.mode == .holdStand
+            if holding { caughtTime += dt }
+            if let p = r.plan, !p.action.isFrustrated { reachableTime += dt }
+            // Stall: on the ground with a real route for 3s without moving.
+            if r.mode == .ground, let p = r.plan, !p.action.isFrustrated, !holding {
+                if (r.pos - anchor).len > 10 { anchor = r.pos; stillSince = tt }
+                else if tt - stillSince > 3 {
+                    stalls += 1; stillSince = tt
+                    if trace.count < 6 { trace.append(String(format: "stall at (%.0f,%.0f) plan=%@", r.pos.x, r.pos.y, "\(p.action)")) }
+                }
+            } else { anchor = r.pos; stillSince = tt }
+            // Dithering: turning round on the ground while following a route.
+            if r.mode == .ground, let p = r.plan, !p.action.isFrustrated, abs(r.vel.x) > 60 {
+                let d: CGFloat = r.vel.x > 0 ? 1 : -1
+                if lastDir != 0 && d != lastDir { reversals += 1 }
+                lastDir = d
+            }
+            // Plan flips: the chosen route changes with no move made in between.
+            if r.lastSig != lastPlanSig {
+                if r.attemptLog.count == attemptsAtFlip && r.mode == .ground { flips += 1 }
+                lastPlanSig = r.lastSig; attemptsAtFlip = r.attemptLog.count
+            }
+        }
+        // Loops: the same route step attempted 3+ times within 12s.
+        var loops = 0
+        let log = r.attemptLog
+        var i = 0
+        while i < log.count {
+            let same = log[i...].prefix { $0.t - log[i].t < 12 }.filter { $0.sig == log[i].sig }.count
+            if same >= 3 { loops += 1; i += same } else { i += 1 }
+        }
+        print("\(URL(fileURLWithPath: path).lastPathComponent): \(baseSegs.count) ledges, \(baseWalls.count) walls, \(Int(minutes)) min")
+        print(String(format: "  holding cursor %.0f%% of time, route available %.0f%%", caughtTime / tt * 100, reachableTime / tt * 100))
+        print("  attempts=\(r.attemptLog.count) loops(3+ same step in 12s)=\(loops) stalls(3s)=\(stalls) reversals=\(reversals) plan flips=\(flips)")
+        print("  ", r.stats.sorted { $0.key < $1.key })
+        for l in trace { print("   ", l) }
+    }
+}
+
 /// Hangs him on a cursor, then moves the cursor in circles and reports how he swings.
 func spinTest() {
     _ = NSApplication.shared
@@ -2699,6 +2852,7 @@ let args = CommandLine.arguments
 if let i = args.firstIndex(of: "--snapshot"), i + 1 < args.count { renderSnapshot(to: args[i + 1]); exit(0) }
 if args.contains("--selftest") { selfTest(); exit(0) }
 if args.contains("--spin-test") { spinTest(); exit(0) }
+if let i = args.firstIndex(of: "--stress") { stressTest(Array(args[(i + 1)...]), minutes: 6); exit(0) }
 if let i = args.firstIndex(of: "--icon"), i + 1 < args.count { renderIconSet(to: args[i + 1]); exit(0) }
 if let i = args.firstIndex(of: "--film"), i + 1 < args.count { renderFilm(to: args[i + 1], seed: args.contains("--alt") ? 1 : 0); exit(0) }
 if let i = args.firstIndex(of: "--vision-test"), i + 2 < args.count { visionTest(args[i + 1], args[i + 2]); exit(0) }

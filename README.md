@@ -29,6 +29,8 @@ build/StickChase --selftest                 # planner timing + headless 8-minute
 build/StickChase --snapshot poses.png       # pose sheet
 build/StickChase --film film.png [--alt]    # contact sheet of a simulated chase
 build/StickChase --vision-test in.png out.png   # edge detection on a screenshot
+build/StickChase --stress a.png b.png       # 6-minute chases over screenshot edges: loops, stalls, falls
+build/StickChase --spin-test                # swing him in circles and report turns / letting go
 STICKCHASE_LOG=1 "Stick Chase.app/Contents/MacOS/StickChase"   # log state twice a second
 ```
 
