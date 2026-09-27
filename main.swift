@@ -32,7 +32,6 @@ let WALL_OFFSET: CGFloat = 6         // feet distance from a wall while on it
 let MANTLE_IN: CGFloat = 8           // where he stands after pulling up onto a ledge
 let NODE_STRIDE: CGFloat = 30
 let HANG_LEN: CGFloat = 37           // hand-to-feet distance hanging from the cursor
-let HANG_FLING: CGFloat = 2600       // cursor speed that shakes him off
 let RIDE_FLING: CGFloat = 1700
 let LEAP_RANGE: CGFloat = 260        // horizontal reach of a leap off a wall
 let LEDGE_REACH: CGFloat = JUMP_MAX + HAND_REACH - 12
@@ -1250,6 +1249,7 @@ final class Runner {
     var mantleT: CGFloat = 0, mantleDur: CGFloat = 0.32, mantleFrom = CGPoint.zero, mantleTo = CGPoint.zero
     // holding the cursor
     var theta: CGFloat = 0, omega: CGFloat = 0, grabCooldown: CGFloat = 0
+    var spins: CGFloat = 0, grip: CGFloat = 0, dizzy = false
     var stillT: CGFloat = 0, trickT: CGFloat = 2, pullT: CGFloat = 0, kickT: CGFloat = 0, rideT: CGFloat = 0, hopT: CGFloat = 0
     // planning
     var plan: Plan?
@@ -1689,7 +1689,10 @@ final class Runner {
         plan = nil
         vel = P(vx * 0.85, 0)
         if abs(vx) > 20 { facing = vx > 0 ? 1 : -1 }
-        if fallH > 150 && abs(vx) > 80 && chance(0.35 + pers.flair * 0.5) {
+        if dizzy {
+            dizzy = false
+            stumbleT = 1.3; vel.x *= 0.5          // spun too much: staggers about
+        } else if fallH > 150 && abs(vx) > 80 && chance(0.35 + pers.flair * 0.5) {
             rollT = 0.36
             vel.x = facing * clampf(abs(vx), 110, 220)
         } else if fallH > 150 && chance(pers.flair * 0.3) {
@@ -1860,15 +1863,14 @@ final class Runner {
         mode = .hang
         setPos(P(c.x, c.y - 62 * S))
         trick = .none; intent = .none; wallIntent = nil; leapIntent = false; plan = nil
-        stillT = 0; trickT = rnd(1.2...2.5)
+        stillT = 0; trickT = rnd(1.2...2.5); spins = 0; grip = GRAV
     }
 
     func stepHang(_ dt: CGFloat, _ cur: CursorState) {
         let c = cur.p
-        if cur.speed > HANG_FLING { release(cur); return }
         stillT = cur.speed < 60 ? stillT + dt : 0
         pullT = max(0, pullT - dt); kickT = max(0, kickT - dt)
-        if stillT > 1.0 {
+        if stillT > 1.0 && abs(omega) < 2 {
             trickT -= dt
             if trickT <= 0 {
                 trickT = rnd(1.6...3.2) * pers.patience
@@ -1879,15 +1881,22 @@ final class Runner {
                 else if chance(pers.flair) { setPos(c); startRide(); return }
             }
         }
-        // Pendulum from a moving pivot. Cursor acceleration is damped so ordinary mouse moves
-        // give a sway, not a spin.
-        let ax = clampf(cur.a.x * 0.45, -6000, 6000)
-        let g = max(GRAV + cur.a.y * 0.45, GRAV * 0.35)
-        let alpha = (-ax * cos(theta) - g * sin(theta)) / HANG_LEN - 2.4 * omega
-        omega = clampf(omega + alpha * dt, -9, 9)
-        theta = theta + omega * dt
-        if abs(theta) > 1.25 { theta = clampf(theta, -1.25, 1.25); omega *= -0.3 }
+        // A real pendulum hanging from the moving cursor: move the mouse in circles near his
+        // natural swing rate (about once a second) and he goes right over the top.
+        let a = clampLen(cur.a, 30000)
+        let alpha = (-a.x * cos(theta) - (GRAV + a.y) * sin(theta)) / HANG_LEN - 0.8 * omega
+        omega = clampf(omega + alpha * dt, -18, 18)
+        theta += omega * dt
+        if theta > .pi { theta -= 2 * .pi; spins += 1 } else if theta < -.pi { theta += 2 * .pi; spins += 1 }
+        spins = max(0, spins - dt * 0.15)
+        // He lets go when the pull on his arms beats his grip (a sharp flick), not just because
+        // the cursor is moving fast.
+        let tension = HANG_LEN * omega * omega + (GRAV + a.y) * cos(theta) - a.x * sin(theta)
+        grip = lerp(grip, tension, min(1, 25 * dt))
+        if grip > 22000 || cur.speed > 4500 { release(cur); return }
         pos = P(c.x, c.y - 62 * S)
+        // Feet can find a ledge only when he's hanging calmly, not mid-swing.
+        guard abs(omega) < 3 && abs(theta) < 0.6 else { return }
         let feet = P(c.x + HANG_LEN * sin(theta), c.y - HANG_LEN * cos(theta))
         var best: Int? = nil
         for i in world.segsInY(feet.y, c.y - 14) where world.segs[i].contains(feet.x, 1) {
@@ -1906,18 +1915,25 @@ final class Runner {
         let c = cur.p
         let feet = P(c.x + HANG_LEN * sin(theta), c.y - HANG_LEN * cos(theta))
         var v = cur.v * 0.85 + P(cos(theta), sin(theta)) * (omega * HANG_LEN)
-        let m = v.len
-        if m > 1400 { v = v * (1400 / m) }
+        if v.len > 1900 { v = v * (1900 / v.len) }
         setPos(feet)
         launch(vx: v.x, vy: v.y)
-        if m > 800 { trick = chance(0.5) ? .front : .back; trickDur = 0.55 }
+        // Keep tumbling the way he was spinning. World spin = facing * local rotation.
+        if abs(omega) > 5 {
+            trick = omega * facing > 0 ? .back : .front
+            trickDur = clampf(2 * .pi / abs(omega), 0.3, 0.7)
+        } else if v.len > 800 {
+            trick = chance(0.5) ? .front : .back; trickDur = 0.55
+        }
+        dizzy = spins >= 2
+        spins = 0; grip = 0
         grabCooldown = 1.0
     }
 
     func stepHold(_ dt: CGFloat, _ cur: CursorState) {
         let c = cur.p
         guard world.segIndex(owner: gOwner, x: pos.x, y: pos.y) != nil else { startHang(cur); return }
-        if cur.speed > HANG_FLING { mode = .ground; grabCooldown = 1.0; return }
+        if cur.speed > 3000 { mode = .ground; grabCooldown = 1.0; return }
         let h = c.y - pos.y
         if h > HANG_LEN + 2 { startHang(cur); return }
         if h < 17 { mode = .ground; grabCooldown = 0.3; return }
@@ -2019,7 +2035,16 @@ final class Runner {
                 return (p, 1.8)
             }
             if heroT > 0 { return (heroT > 0.15 ? Poses.hero : Poses.stand(t), heroT > 0.15 ? 1.6 : 0.8) }
-            if stumbleT > 0 { return (Poses.stumble(t), 1.2) }
+            if stumbleT > 0 {
+                if stumbleT > 0.35 {
+                    // Dizzy: swaying on the spot, head lolling.
+                    var p = Poses.stand(t, look: 0.4 * sin(t * 7))
+                    p.hL = p.shoulder + P(-10 + 3 * sin(t * 9), -8); p.hR = p.shoulder + P(10 + 3 * cos(t * 8), -7)
+                    p.pivot = P(0, 0); p.rot = 0.28 * sin(t * 5.5)
+                    return (p, 0.9)
+                }
+                return (Poses.stumble(t), 1.2)
+            }
             if landT > 0 { return (Poses.crouch(landDepth), 1.7) }
             if preDropT > 0 { return (Poses.crouch(0.6), 1.5) }
             if skidding { return (Poses.skid, 1.2) }
@@ -2067,9 +2092,9 @@ final class Runner {
         case .hang:
             let pull = pullT > 0 ? pow(sin(.pi * frac((1.8 - pullT) / 0.9)), 2) : 0
             let kick = kickT > 0 ? sin(t * 14) : 0.3 * sin(t * 2.6)
-            var p = Poses.hang(clampf(-omega * 3, -8, 8), pull, kick)
+            var p = Poses.hang(clampf(-omega * 1.2, -6, 6), pull, kick)
             p.rot = theta * facing
-            return (p, 1.2)
+            return (p, 1.2 + min(abs(omega) / 5, 2.5))
         case .holdStand:
             return (Poses.hold(t, local, runPhase, abs(vel.x)), 1.3)
         case .ride:
@@ -2522,11 +2547,44 @@ func selfTest() {
     print("simulated 480s: frames off-screen=\(outside)", modes.sorted { $0.value > $1.value })
 }
 
+/// Hangs him on a cursor, then moves the cursor in circles and reports how he swings.
+func spinTest() {
+    _ = NSApplication.shared
+    let w = World()
+    let frame = CGRect(x: 0, y: 0, width: 1470, height: 956)
+    w.screens = [(frame: frame, visible: frame)]
+    w.rebuild([])
+    let dt: CGFloat = 1.0 / 240
+    for (radius, hz) in [(CGFloat(0), CGFloat(0)), (15, 1.0), (25, 1.1), (40, 1.1), (40, 1.4), (70, 1.2), (100, 1.0), (60, 2.2)] {
+        let r = Runner(world: w, cursor: P(700, 600))
+        let cur = CursorTracker()
+        let centre = P(700, 600)
+        cur.update(centre, dt)
+        r.startHang(cur.s)
+        var loops: CGFloat = 0, lastTheta = r.theta, released: CGFloat = -1, maxAngle: CGFloat = 0
+        var tt: CGFloat = 0
+        while tt < 8 {
+            tt += dt
+            let ramp = min(tt / 1.5, 1)
+            let c = centre + P(cos(2 * .pi * hz * tt) - 1, sin(2 * .pi * hz * tt)) * (radius * ramp)
+            cur.update(c, dt)
+            r.step(dt, cur.s)
+            if r.mode != .hang { released = tt; break }
+            loops += angleDiff(lastTheta, r.theta) / (2 * .pi)
+            lastTheta = r.theta
+            maxAngle = max(maxAngle, abs(r.theta))
+        }
+        print(String(format: "circle r=%3.0fpt %.1fHz: net %.1f rev, max angle %3.0f°, %@", radius, hz, abs(loops), maxAngle * 180 / .pi,
+                     released >= 0 ? String(format: "let go at %.1fs (dizzy=%@)", released, r.dizzy ? "yes" : "no") : "still holding"))
+    }
+}
+
 // MARK: - Main
 
 let args = CommandLine.arguments
 if let i = args.firstIndex(of: "--snapshot"), i + 1 < args.count { renderSnapshot(to: args[i + 1]); exit(0) }
 if args.contains("--selftest") { selfTest(); exit(0) }
+if args.contains("--spin-test") { spinTest(); exit(0) }
 if let i = args.firstIndex(of: "--film"), i + 1 < args.count { renderFilm(to: args[i + 1], seed: args.contains("--alt") ? 1 : 0); exit(0) }
 if let i = args.firstIndex(of: "--vision-test"), i + 2 < args.count { visionTest(args[i + 1], args[i + 2]); exit(0) }
 
