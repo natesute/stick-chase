@@ -2157,14 +2157,70 @@ final class Overlay {
     }
 }
 
+// MARK: - Controls
+
+/// The small window that opens when you click the Dock icon.
+final class ControlWindow: NSObject {
+    let window: NSWindow
+    unowned let app: AppDelegate
+    private let pause = NSButton(title: "Pause", target: nil, action: nil)
+    private let visionLabel = NSTextField(labelWithString: "")
+    private let visionButton = NSButton(title: "Enable…", target: nil, action: nil)
+    private let surfaces = NSButton(checkboxWithTitle: "Show surfaces he can use", target: nil, action: nil)
+    private let shadow = NSButton(checkboxWithTitle: "Soft shadow (easier to see on white)", target: nil, action: nil)
+    private let restart = NSButton(title: "Restart", target: nil, action: nil)
+    private let quit = NSButton(title: "Quit Stick Chase", target: nil, action: nil)
+
+    init(app: AppDelegate) {
+        self.app = app
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 320, height: 210), styleMask: [.titled, .closable],
+                          backing: .buffered, defer: false)
+        window.title = "Stick Chase"
+        window.isReleasedWhenClosed = false
+        super.init()
+        for (b, sel) in [(pause, #selector(AppDelegate.togglePause(_:))), (visionButton, #selector(AppDelegate.enableVision(_:))),
+                         (surfaces, #selector(AppDelegate.toggleSurfaces(_:))), (shadow, #selector(AppDelegate.toggleShadow(_:))),
+                         (restart, #selector(AppDelegate.restart(_:))), (quit, #selector(NSApplication.terminate(_:)))] {
+            b.target = sel == #selector(NSApplication.terminate(_:)) ? NSApp : app
+            b.action = sel
+        }
+        pause.bezelStyle = .rounded
+        quit.bezelStyle = .rounded
+        restart.bezelStyle = .rounded
+        visionButton.bezelStyle = .rounded
+        let visionRow = NSStackView(views: [visionLabel, visionButton])
+        visionRow.spacing = 8
+        let bottom = NSStackView(views: [restart, quit])
+        bottom.spacing = 8
+        let stack = NSStackView(views: [pause, visionRow, surfaces, shadow, bottom])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 12
+        stack.edgeInsets = NSEdgeInsets(top: 18, left: 20, bottom: 18, right: 20)
+        stack.setCustomSpacing(18, after: shadow)
+        window.contentView = stack
+        refresh()
+        window.setContentSize(stack.fittingSize)
+    }
+
+    func refresh() {
+        pause.title = app.paused ? "Resume" : "Pause"
+        let on = app.vision.running
+        visionLabel.stringValue = on ? "Screen vision: on" : "Screen vision: off"
+        visionButton.isHidden = on
+        restart.isHidden = on || !CGPreflightScreenCaptureAccess()
+        surfaces.state = app.showSurfaces ? .on : .off
+        shadow.state = app.shadow ? .on : .off
+    }
+}
+
 // MARK: - App
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     let world = World()
     var runner: Runner!
     var overlays: [Overlay] = []
-    var statusItem: NSStatusItem!
-    var visionItem: NSMenuItem!
+    var controls: ControlWindow?
     var timer: Timer?
     var displayLink: AnyObject?
     var paused = false
@@ -2183,12 +2239,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         for other in NSRunningApplication.runningApplications(withBundleIdentifier: BUNDLE_ID) where other != me {
             other.terminate()
         }
-        NSApp.setActivationPolicy(.accessory)
+        // A normal Dock app: right-click the Dock icon to quit, click it for controls.
+        NSApp.setActivationPolicy(.regular)
         world.refresh(force: true)
         buildOverlays()
         runner = Runner(world: world, cursor: NSEvent.mouseLocation)
         runner.layers = overlays.map { $0.makeFigureLayers() }
-        setupStatusItem()
+        setupMainMenu()
         startClock()
         vision.onUpdate = { [weak self] segs, walls in
             guard let self else { return }
@@ -2217,16 +2274,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         vision.start { [weak self] _ in self?.updateVisionItem() }
     }
 
-    func updateVisionItem() {
-        guard visionItem != nil else { return }
-        if vision.running {
-            visionItem.title = "Screen Vision: On"
-            visionItem.isEnabled = false
-        } else {
-            visionItem.title = "Enable Screen Vision…"
-            visionItem.isEnabled = true
-        }
-    }
+    func updateVisionItem() { controls?.refresh() }
 
     @objc func enableVision(_ sender: Any?) {
         if CGPreflightScreenCaptureAccess() { startVision(prompt: false); return }
@@ -2236,7 +2284,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         let alert = NSAlert()
         alert.messageText = "Let Stick Chase see your screen"
-        alert.informativeText = "Turn on Stick Chase under Screen & System Audio Recording, then choose Restart Stick Chase from its menu. He'll use buttons, icons, images and panels as ledges and walls. Nothing is saved or sent anywhere."
+        alert.informativeText = "Turn on Stick Chase under Screen & System Audio Recording, then click Restart in the Stick Chase controls (click its Dock icon). He'll use buttons, icons, images and panels as ledges and walls. Nothing is saved or sent anywhere."
         alert.runModal()
     }
 
@@ -2270,48 +2318,62 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         overlays = NSScreen.screens.map { Overlay(screen: $0) }
     }
 
-    func setupStatusItem() {
-        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        if let img = NSImage(systemSymbolName: "figure.run", accessibilityDescription: "Stick Chase") {
-            img.isTemplate = true
-            statusItem.button?.image = img
-        } else {
-            statusItem.button?.title = "🏃"
-        }
+    func setupMainMenu() {
+        let main = NSMenu()
+        let appItem = NSMenuItem()
+        main.addItem(appItem)
         let m = NSMenu()
-        m.autoenablesItems = false
-        m.addItem(withTitle: "Pause", action: #selector(togglePause(_:)), keyEquivalent: "p")
+        m.addItem(withTitle: "Show Controls", action: #selector(showControls(_:)), keyEquivalent: ",").target = self
         m.addItem(.separator())
-        visionItem = m.addItem(withTitle: "Enable Screen Vision…", action: #selector(enableVision(_:)), keyEquivalent: "")
-        m.addItem(withTitle: "Show Surfaces", action: #selector(toggleSurfaces(_:)), keyEquivalent: "d")
-        m.addItem(withTitle: "Soft Shadow", action: #selector(toggleShadow(_:)), keyEquivalent: "s")
-        m.addItem(.separator())
-        m.addItem(withTitle: "Restart Stick Chase", action: #selector(restart(_:)), keyEquivalent: "")
         m.addItem(withTitle: "Quit Stick Chase", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
-        for item in m.items where item.action != #selector(NSApplication.terminate(_:)) { item.target = self }
-        statusItem.menu = m
-        updateVisionItem()
+        appItem.submenu = m
+        NSApp.mainMenu = main
     }
 
-    @objc func togglePause(_ sender: NSMenuItem) {
+    /// Right-clicking the Dock icon: these items appear above the Dock's own Quit.
+    func applicationDockMenu(_ sender: NSApplication) -> NSMenu? {
+        let m = NSMenu()
+        m.addItem(withTitle: paused ? "Resume" : "Pause", action: #selector(togglePause(_:)), keyEquivalent: "").target = self
+        let surf = m.addItem(withTitle: "Show Surfaces", action: #selector(toggleSurfaces(_:)), keyEquivalent: "")
+        surf.target = self; surf.state = showSurfaces ? .on : .off
+        m.addItem(withTitle: "Controls…", action: #selector(showControls(_:)), keyEquivalent: "").target = self
+        return m
+    }
+
+    /// Clicking the Dock icon opens the controls.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        showControls(nil)
+        return true
+    }
+
+    @objc func showControls(_ sender: Any?) {
+        if controls == nil { controls = ControlWindow(app: self) }
+        controls?.refresh()
+        controls?.window.center()
+        controls?.window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    @objc func togglePause(_ sender: Any?) {
         paused.toggle()
-        sender.title = paused ? "Resume" : "Pause"
+        if paused { for l in runner.layers { for s in [l.near, l.far, l.head] + l.ghosts { s.path = nil } } }
+        controls?.refresh()
     }
 
-    @objc func toggleShadow(_ sender: NSMenuItem) {
+    @objc func toggleShadow(_ sender: Any?) {
         shadow.toggle()
-        sender.state = shadow ? .on : .off
         applyShadow()
+        controls?.refresh()
     }
 
     func applyShadow() {
         for l in runner.layers { for s in [l.near, l.far, l.head] { s.shadowOpacity = shadow ? 0.55 : 0 } }
     }
 
-    @objc func toggleSurfaces(_ sender: NSMenuItem) {
+    @objc func toggleSurfaces(_ sender: Any?) {
         showSurfaces.toggle()
-        sender.state = showSurfaces ? .on : .off
         if !showSurfaces { for o in overlays { o.segLayer.path = nil; o.wallLayer.path = nil; o.planLayer.path = nil } }
+        controls?.refresh()
     }
 
     func drawSurfaces() {
@@ -2547,6 +2609,58 @@ func selfTest() {
     print("simulated 480s: frames off-screen=\(outside)", modes.sorted { $0.value > $1.value })
 }
 
+/// Draws the app icon (a stick figure leaping for a cursor) into an .iconset folder.
+func renderIconSet(to dir: String) {
+    try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    for base in [16, 32, 128, 256, 512] {
+        for scale in [1, 2] {
+            let px = base * scale
+            let size = NSSize(width: px, height: px)
+            let (rep, ctx) = makeCanvas(size, scale: 1)
+            let k = CGFloat(px) / 1024
+            ctx.scaleBy(x: k, y: k)
+            // macOS icon grid: rounded square inset from the canvas edge.
+            let body = CGRect(x: 100, y: 100, width: 824, height: 824)
+            let shape = CGPath(roundedRect: body, cornerWidth: 185, cornerHeight: 185, transform: nil)
+            ctx.addPath(shape); ctx.clip()
+            let grad = CGGradient(colorsSpace: CGColorSpaceCreateDeviceRGB(),
+                                  colors: [NSColor(srgbRed: 0.20, green: 0.21, blue: 0.25, alpha: 1).cgColor,
+                                           NSColor(srgbRed: 0.07, green: 0.07, blue: 0.09, alpha: 1).cgColor] as CFArray,
+                                  locations: [0, 1])!
+            ctx.drawLinearGradient(grad, start: P(0, 924), end: P(0, 100), options: [])
+            // Ledge he's leaping from.
+            ctx.setStrokeColor(NSColor(white: 1, alpha: 0.35).cgColor)
+            ctx.setLineWidth(18); ctx.setLineCap(.round)
+            ctx.move(to: P(170, 250)); ctx.addLine(to: P(470, 250)); ctx.strokePath()
+            // The figure, reaching up and right for the cursor.
+            ctx.saveGState()
+            ctx.translateBy(x: 380, y: 300)
+            ctx.scaleBy(x: 13.5, y: 13.5)
+            var pose = Poses.reach(P(20, 58))
+            pose.rot = -0.25
+            let (near, far, head) = figurePaths(pose, .zero, 1)
+            ctx.setLineCap(.round); ctx.setLineJoin(.round); ctx.setLineWidth(2.4)
+            ctx.setStrokeColor(NSColor(white: 1, alpha: 0.7).cgColor); ctx.addPath(far); ctx.strokePath()
+            ctx.setStrokeColor(NSColor.white.cgColor); ctx.addPath(near); ctx.strokePath()
+            ctx.setFillColor(NSColor.white.cgColor); ctx.addPath(head); ctx.fillPath()
+            ctx.restoreGState()
+            // Cursor arrow, tip at top right.
+            let tip = P(700, 800)
+            let arrow = CGMutablePath()
+            let pts: [CGPoint] = [P(0, 0), P(0, -170), P(40, -132), P(72, -205), P(104, -191), P(73, -120), P(125, -120)]
+            arrow.addLines(between: pts.map { P(tip.x + $0.x, tip.y + $0.y) })
+            arrow.closeSubpath()
+            ctx.addPath(arrow)
+            ctx.setFillColor(NSColor.black.cgColor)
+            ctx.setStrokeColor(NSColor.white.cgColor)
+            ctx.setLineWidth(14); ctx.setLineJoin(.round)
+            ctx.drawPath(using: .fillStroke)
+            let name = scale == 1 ? "icon_\(base)x\(base).png" : "icon_\(base)x\(base)@2x.png"
+            saveCanvas(rep, "\(dir)/\(name)")
+        }
+    }
+}
+
 /// Hangs him on a cursor, then moves the cursor in circles and reports how he swings.
 func spinTest() {
     _ = NSApplication.shared
@@ -2585,6 +2699,7 @@ let args = CommandLine.arguments
 if let i = args.firstIndex(of: "--snapshot"), i + 1 < args.count { renderSnapshot(to: args[i + 1]); exit(0) }
 if args.contains("--selftest") { selfTest(); exit(0) }
 if args.contains("--spin-test") { spinTest(); exit(0) }
+if let i = args.firstIndex(of: "--icon"), i + 1 < args.count { renderIconSet(to: args[i + 1]); exit(0) }
 if let i = args.firstIndex(of: "--film"), i + 1 < args.count { renderFilm(to: args[i + 1], seed: args.contains("--alt") ? 1 : 0); exit(0) }
 if let i = args.firstIndex(of: "--vision-test"), i + 2 < args.count { visionTest(args[i + 1], args[i + 2]); exit(0) }
 
